@@ -2,14 +2,14 @@ use std::{convert::Infallible, ffi::CString, fs, str::FromStr};
 
 use anyhow::{Context, Ok, Result};
 use nix::{
-    mount::MsFlags,
+    mount::{MntFlags, MsFlags},
     sched::CloneFlags,
     sys::wait::WaitStatus,
     unistd::{ForkResult, Gid, Pid, Uid},
 };
 
 fn main() -> Result<()> {
-    print!("Starting tinox...");
+    println!("Starting tinox...");
     let tinox_info = get_process()?;
     print_process(&tinox_info);
     setup_parent_namespaces()?;
@@ -43,8 +43,8 @@ fn change_filesystem() -> Result<()> {
         None::<&str>,
     )
     .context("Failed to mount filesystem")?;
-    //TODO, i'm told pivot_root is better?
-    nix::unistd::chroot("fs/box").context("Could not chroot into mounted folder")?;
+    nix::unistd::pivot_root("fs/box", "fs/box/old").context("Failed to pivot root")?;
+    nix::mount::umount2("/old", MntFlags::MNT_DETACH).context("Failed to unmount the old root")?;
     nix::unistd::chdir("/").context("Failed to change to root directory")
 }
 
