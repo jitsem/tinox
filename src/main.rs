@@ -1,8 +1,14 @@
-use std::{convert::Infallible, ffi::CString, fs, str::FromStr};
+use std::{
+    convert::Infallible,
+    ffi::CString,
+    fs::{self},
+    path::PathBuf,
+    str::FromStr,
+};
 
 use anyhow::{Context, Ok, Result};
 use nix::{
-    mount::{MntFlags, MsFlags},
+    mount::MsFlags,
     sched::CloneFlags,
     sys::wait::WaitStatus,
     unistd::{ForkResult, Gid, Pid, Uid},
@@ -12,13 +18,14 @@ fn main() -> Result<()> {
     println!("Starting tinox...");
     let tinox_info = get_process()?;
     print_process(&tinox_info);
+    let location = setup_run_dir(&tinox_info.u_id)?;
     setup_parent_namespaces()?;
     map_uid_gid(&tinox_info.u_id, &tinox_info.g_id)?;
     match fork_and_wait_for_exit()? {
         ForkRes::Child => {
             isolate_child()?;
             change_hostname()?;
-            change_filesystem()?;
+            change_filesystem(&location)?;
             let child_proc = get_process()?;
             print_process(&child_proc);
             run_command()?;
@@ -34,18 +41,61 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn change_filesystem() -> Result<()> {
+fn setup_run_dir(uid: &Uid) -> Result<ContainerLocation> {
+    let run_dir = PathBuf::from(format!("/run/user/{uid}/tinox/container"));
+    let upper = run_dir.join("upper");
+    let work = run_dir.join("work");
+    let merged = run_dir.join("merged");
+
+    if run_dir.exists() {
+        // Overlayfs leaves work/work as an empty, unreadable directory after unmount.
+        // remove_dir_all can't read into it, so it fails. Simply removing the dir still works
+        // so we try to do that first before deleting al other folders
+        let inner_work = work.join("work");
+        if inner_work.exists() {
+            fs::remove_dir(&inner_work).context("Failed to remove the work dir")?;
+        }
+        fs::remove_dir_all(&run_dir).context("Failed to cleanup previous run dir")?;
+    }
+    fs::create_dir_all(&run_dir).context("Failed to create run dir")?;
+
+    for dir in [&upper, &work, &merged] {
+        fs::create_dir_all(dir).with_context(|| format!("Failed to create {}", dir.display()))?;
+    }
+
+    Ok(ContainerLocation {
+        upper,
+        work,
+        merged,
+    })
+}
+
+fn change_filesystem(location: &ContainerLocation) -> Result<()> {
+    let options = format!(
+        "lowerdir=fs/fs,upperdir={},workdir={}",
+        &location.upper.to_string_lossy(),
+        &location.work.to_string_lossy()
+    );
+    dbg!(&options);
     nix::mount::mount(
-        Some("fs/fs"),
-        "fs/box",
-        None::<&str>,
-        MsFlags::MS_BIND,
-        None::<&str>,
+        Some("overlay"),
+        &location.merged,
+        Some("overlay"),
+        MsFlags::empty(),
+        Some(options.as_str()),
     )
     .context("Failed to mount filesystem")?;
-    nix::unistd::pivot_root("fs/box", "fs/box/old").context("Failed to pivot root")?;
-    nix::mount::umount2("/old", MntFlags::MNT_DETACH).context("Failed to unmount the old root")?;
-    nix::unistd::chdir("/").context("Failed to change to root directory")
+    nix::unistd::chdir(&location.merged).context("Failed to change to merged directory")?;
+    nix::unistd::pivot_root(".", ".").context("Failed to pivot root")?;
+    nix::unistd::chdir("/").context("Failed to change to root directory")?;
+    nix::mount::mount(
+        Some("proc"),
+        "/proc",
+        Some("proc"),
+        MsFlags::empty(),
+        None::<&str>,
+    )
+    .context("Failed to mount proc")
 }
 
 fn change_hostname() -> Result<()> {
@@ -59,7 +109,18 @@ fn setup_parent_namespaces() -> Result<()> {
 
 fn isolate_child() -> Result<()> {
     nix::sched::unshare(CloneFlags::CLONE_NEWUTS).context("Failed to isolate UTS namespace")?;
-    nix::sched::unshare(CloneFlags::CLONE_NEWNS).context("Failed to isolate mount namespace")
+    nix::sched::unshare(CloneFlags::CLONE_NEWNS).context("Failed to isolate mount namespace")?;
+    //By default '/' is mounted shared. So, altough we have a seperate mount table trough the unshare above,
+    // any mount we add/remove under '/' will still be active for other namespaces.
+    //We make it private (recursively) in our new namespace, so mounts we create actually stay local
+    nix::mount::mount(
+        None::<&str>,
+        "/",
+        None::<&str>,
+        MsFlags::MS_PRIVATE | MsFlags::MS_REC,
+        None::<&str>,
+    )
+    .context("Failed mounting root a private")
 }
 
 /// Replace the current process with the actual command we want to run
@@ -123,6 +184,12 @@ fn fork_and_wait_for_exit() -> Result<ForkRes> {
         Result::Ok(ForkResult::Child) => Ok(ForkRes::Child),
         Err(e) => Err(e.into()),
     }
+}
+
+struct ContainerLocation {
+    upper: PathBuf,
+    merged: PathBuf,
+    work: PathBuf,
 }
 
 enum ForkRes {
